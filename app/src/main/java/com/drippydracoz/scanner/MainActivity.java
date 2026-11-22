@@ -120,7 +120,7 @@ public class MainActivity extends Activity {
             output.append("\nGATEWAY\n");
 
             for (RouteInfo route : links.getRoutes()) {
-                if (route.isDefault() && route.getGateway() != null) {
+                if (route.getDestination().getPrefixLength() == 0 && route.getGateway() != null) {
                     output.append(route.getGateway().getHostAddress())
                         .append("\n");
                 }
