@@ -4,3 +4,7 @@ local.properties
 backups/
 *.backup
 ettings.gradle
+__pycache__/
+*.pyc
+*.before_reporting
+patch_reporting.py

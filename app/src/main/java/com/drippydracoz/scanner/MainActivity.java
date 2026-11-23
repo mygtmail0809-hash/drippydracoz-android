@@ -6,6 +6,7 @@ import android.os.Build;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.net.ConnectivityManager;
+import android.net.TrafficStats;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -18,6 +19,7 @@ import android.view.Gravity;
 import android.text.InputType;
 
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 import java.io.*;
 import java.net.*;
@@ -30,6 +32,7 @@ import android.util.Base64;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
 
@@ -96,7 +99,7 @@ public class MainActivity extends Activity {
         layout.addView(status);
 
         Button refresh = new Button(this);
-        refresh.setText("REFRESH MY NETWORK INFO");
+        refresh.setText("REFRESH & SYNC MY INFO");
         layout.addView(refresh);
 
         results = new TextView(this);
@@ -109,7 +112,7 @@ public class MainActivity extends Activity {
         setContentView(scroll);
 
         pairButton.setOnClickListener(v -> pairDevice());
-        refresh.setOnClickListener(v -> scanNetwork());
+        refresh.setOnClickListener(v -> { scanNetwork(); reportDeviceInfo(); });
 
         scanNetwork();
     }
@@ -195,11 +198,14 @@ public class MainActivity extends Activity {
 
                 String token = data.getString("token");
                 saveEncryptedToken(token);
+                saveServerBase(base);
 
                 runOnUiThread(() -> {
-                    status.setText("PAIRED SUCCESSFULLY");
+                    status.setText("PAIRED SUCCESSFULLY — SENDING FIRST REPORT...");
                     pairButton.setEnabled(true);
                     codeInput.setText("");
+                    scanNetwork();
+                    reportDeviceInfo();
                 });
 
             } catch (Exception e) {
@@ -334,6 +340,209 @@ public class MainActivity extends Activity {
 
         output.append("\nHotspot client discovery: Not yet verified.");
         results.setText(output.toString());
+    }
+
+
+    private void saveServerBase(String base) {
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .edit()
+            .putString("server_base", base.replaceAll("/+$", ""))
+            .apply();
+    }
+
+    private String loadDecryptedToken() throws Exception {
+        SharedPreferences prefs =
+            getSharedPreferences(PREFS, MODE_PRIVATE);
+
+        String encryptedText = prefs.getString("token", null);
+        String ivText = prefs.getString("iv", null);
+
+        if (encryptedText == null || ivText == null) {
+            throw new Exception("This phone is not paired.");
+        }
+
+        KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+        keyStore.load(null);
+
+        SecretKey secretKey =
+            (SecretKey) keyStore.getKey(ALIAS, null);
+
+        if (secretKey == null) {
+            throw new Exception("Secure pairing key is unavailable. Pair again.");
+        }
+
+        byte[] encrypted = Base64.decode(encryptedText, Base64.NO_WRAP);
+        byte[] iv = Base64.decode(ivText, Base64.NO_WRAP);
+
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            secretKey,
+            new GCMParameterSpec(128, iv)
+        );
+
+        return new String(
+            cipher.doFinal(encrypted),
+            StandardCharsets.UTF_8
+        );
+    }
+
+    private JSONObject buildDeviceReport() throws Exception {
+        JSONObject report = new JSONObject();
+        JSONArray ips = new JSONArray();
+        JSONArray dns = new JSONArray();
+
+        ConnectivityManager cm =
+            (ConnectivityManager) getSystemService(
+                Context.CONNECTIVITY_SERVICE
+            );
+
+        Network network = cm.getActiveNetwork();
+        String networkType = "Offline";
+        String gateway = "";
+
+        if (network != null) {
+            NetworkCapabilities caps =
+                cm.getNetworkCapabilities(network);
+
+            if (caps != null) {
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    networkType = "Wi-Fi";
+                } else if (caps.hasTransport(
+                    NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                    networkType = "Mobile data";
+                } else if (caps.hasTransport(
+                    NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                    networkType = "Ethernet";
+                } else if (caps.hasTransport(
+                    NetworkCapabilities.TRANSPORT_BLUETOOTH)) {
+                    networkType = "Bluetooth";
+                } else {
+                    networkType = "Other";
+                }
+            }
+
+            LinkProperties links = cm.getLinkProperties(network);
+
+            if (links != null) {
+                for (android.net.LinkAddress address :
+                    links.getLinkAddresses()) {
+                    ips.put(address.getAddress().getHostAddress());
+                }
+
+                for (InetAddress address : links.getDnsServers()) {
+                    dns.put(address.getHostAddress());
+                }
+
+                for (RouteInfo route : links.getRoutes()) {
+                    if (route.getDestination().getPrefixLength() == 0 &&
+                        route.getGateway() != null) {
+                        gateway = route.getGateway().getHostAddress();
+                        break;
+                    }
+                }
+            }
+        }
+
+        int uid = android.os.Process.myUid();
+        long tx = TrafficStats.getUidTxBytes(uid);
+        long rx = TrafficStats.getUidRxBytes(uid);
+
+        report.put("network_type", networkType);
+        report.put("ip_addresses", ips);
+        report.put("dns_servers", dns);
+        report.put("gateway", gateway);
+        report.put("android_version", Build.VERSION.RELEASE);
+        report.put("tx_bytes", tx);
+        report.put("rx_bytes", rx);
+
+        return report;
+    }
+
+    private void reportDeviceInfo() {
+        SharedPreferences prefs =
+            getSharedPreferences(PREFS, MODE_PRIVATE);
+
+        String base = prefs.getString("server_base", "");
+
+        if (!base.startsWith("https://")) {
+            status.setText("Pair this phone before sending reports.");
+            return;
+        }
+
+        executor.execute(() -> {
+            HttpURLConnection connection = null;
+
+            try {
+                String token = loadDecryptedToken();
+                JSONObject report = buildDeviceReport();
+
+                URL url = new URL(
+                    base.replaceAll("/+$", "") +
+                    "/api/companion/report"
+                );
+
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(15000);
+                connection.setDoOutput(true);
+                connection.setRequestProperty(
+                    "Content-Type", "application/json"
+                );
+                connection.setRequestProperty(
+                    "Authorization", "Bearer " + token
+                );
+
+                try (OutputStream out = connection.getOutputStream()) {
+                    out.write(report.toString().getBytes(
+                        StandardCharsets.UTF_8
+                    ));
+                }
+
+                int responseCode = connection.getResponseCode();
+
+                InputStream stream = responseCode >= 200 &&
+                    responseCode < 300
+                    ? connection.getInputStream()
+                    : connection.getErrorStream();
+
+                StringBuilder response = new StringBuilder();
+
+                if (stream != null) {
+                    try (BufferedReader reader =
+                        new BufferedReader(new InputStreamReader(stream))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            response.append(line);
+                        }
+                    }
+                }
+
+                if (responseCode < 200 || responseCode >= 300) {
+                    JSONObject error = new JSONObject(response.toString());
+                    throw new Exception(
+                        error.optString("error", "Report was rejected.")
+                    );
+                }
+
+                runOnUiThread(() ->
+                    status.setText("REPORT SENT — NETWORK INFO UPDATED")
+                );
+
+            } catch (Exception e) {
+                String message = e.getMessage();
+
+                runOnUiThread(() ->
+                    status.setText("REPORT ERROR: " + message)
+                );
+
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        });
     }
 
     @Override
