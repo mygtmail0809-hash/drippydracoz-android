@@ -1,0 +1,6 @@
+.gradle/
+**/build/
+local.properties
+backups/
+*.backup
+ettings.gradle
